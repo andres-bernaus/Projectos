@@ -13,29 +13,43 @@ from functools import wraps
 import string
 
 from Measurement_table import Measurement_table
-#from GlucoseSQL_controller import GlucoseDB
-from GlucoseMongoDB_controller import GlucoseDB
+from GlucoseSQL_controller import GlucoseDB
+#from GlucoseMongoDB_controller import GlucoseDB
 
 import os
 from os.path import isfile, getsize
+import socket
+
+
 
 app = flask.Flask(__name__)
 
 app.config['SECRET_KEY'] = "SSIV-33"
 
+#Get local ip
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.connect(('8.8.8.8',1))
+app.config['localIP'] = s.getsockname()[0]
+
 allowedTimeSlots = ("antes del desayuno","despues del desayuno","antes del almuerzo","despues del almuerzo",
                     "antes de la merienda","despues de la merienda","antes de la cena","despues de la cena")
 
 
-#db = GlucoseDB('measurements.db')
-db = GlucoseDB('Measurements')
+db = GlucoseDB('measurements.db')  #SQL
+#db = GlucoseDB('Measurements')      #Mongodb
 
-def modify_measure(new_measure):
-    #To do
-    return page_not_found(404)
+
+def add_arguments_to_measurement(measurement,json):
+    parameters = ['value','food_insuline','correction_insuline',"carbs","id"]
+    for param in parameters:
+        measurement[param] = 0
+        if param in json:
+            measurement[param] = int(json[param])
+
+
 
 def invalidTimeSlot(timeSlot):
-    timeSlot = string.lower(timeSlot)
+    timeSlot = timeSlot.lower()
     return not (timeSlot in allowedTimeSlots)
 
 #Decorator to manage token autenthication
@@ -115,25 +129,42 @@ def get_all_users(current_user):
 @app.route('/api/v1/users', methods=['GET','DELETE'])
 @token_required
 def get_or_delete_user(current_user):
-    if not current_user['isAdmin']:
-        return jsonify({'message' : 'Cannot perform that function!'}),403
 
     query_parameters = request.args
 
     id = query_parameters.get('id')
+    username = query_parameters.get('name')
+    
+    if id:
+        try:
+            id = int(id)
+        except ValueError:
+            return jsonify({'message':"'id' must be an integer"}),400
 
-    if not id:
-        return page_not_found(404)
+        user = db.get_user_by_id(id)
+    else:
+        if username:
+            user = db.get_user_with_name(username)
+        else:
+            return jsonify({'message':'User not found'}),404  
 
-    try:
-        id = int(id)
-    except ValueError:
-        return jsonify({'message':"'id' must be an integer"}),400
+    if not user:
+        return jsonify({'message':'User not found'}),404  
+        
+    if (not current_user["isAdmin"]) and (current_user["UserID"] != user["UserID"]):
+        return jsonify({'message' : 'Cannot perform that function!'}),403
+
+    if not user:
+        return jsonify({'message':'User not found'}),404  
 
     if request.method == 'GET':
-        return jsonify(db.get_user_by_id(id)),200
+        return jsonify(user),200
     if request.method == 'DELETE':
-        db.delete_user(id)
+        if not current_user['isAdmin']:
+            return jsonify({'message' : 'Cannot perform that function!'}),403
+
+        db.delete_all_measurements_for_user(int(user["UserID"]))
+        db.delete_user(int(user["UserID"]))
         return jsonify({'message':"User with id={} deleted".format(id)}), 200
 
 
@@ -151,12 +182,13 @@ def create_user(current_user):
     hashed_password = generate_password_hash(request.json['password'], method='sha256')
 
     #Check if username already exists
-    if db.get_user_with_name(request.json['user']):
+    input_username = request.json['user']
+    if db.get_user_with_name(input_username):
         return jsonify({'message' : "Username already in use"}),400
 
     db.add_new_user(request.json['user'],str(uuid.uuid4()),hashed_password,False)
-
-    return jsonify({'message' : 'New user created!'}),201
+    id = db.get_user_with_name(input_username)["UserID"]
+    return jsonify({'message' : 'New user created!','UserID':id}),201
 
 
 
@@ -177,6 +209,12 @@ def promote_user(current_user):
         id = int(id)
     except ValueError:
         return jsonify({'message':"'id' must be an integer"}),400
+
+    user = db.get_user_by_id(id)
+
+    if not user:
+        return jsonify({'message':'User not found'}),404  
+
     
     user_data = {}
     user_data['isAdmin'] = True
@@ -215,19 +253,20 @@ def api_filter(current_user):
         except ValueError:
             return jsonify({'message' : "Must use YYYY-MM-DD HH:MM as Date format"}),400
 
-        timeSlot = string.lower(request.json['timeSlot'])
+        timeSlot = request.json['timeSlot'].lower()
         if invalidTimeSlot(timeSlot):
             return jsonify({'message' : "Must use a valid Time Slot: <antes del desayuno> <antes del almuerzo> <antes de la merienda> <antes de la cena> <despues del desayuno> ..."}),400
+    
+        new_measure = {}
+        new_measure['timeSlot'] = timeSlot
+        new_measure['date'] = date
+        add_arguments_to_measurement(new_measure,request.json)
 
-        if "id" in request.json:
-            new_measure = {}
-            new_measure["id"] = request.json["id"]
-            new_measure['value'] = request.json['value']
-            new_measure['timeSlot'] = timeSlot
-            new_measure['date'] = date
-            return modify_measurent(new_measure)
+        if new_measure["id"] != 0:
+            db.modify_measure(new_measure)
+            return jsonify({'message' : "The resource was succesfully modified"}),201
 
-        db.insert_measure(int(current_user['UserID']),timeSlot,date,request.json['value'])
+        db.insert_measure(int(current_user['UserID']),new_measure)
         return jsonify({'message' : "The resource was succesfully added"}),201
 
     #For GET or DELETE a measurement Id is needed
@@ -246,11 +285,12 @@ def api_filter(current_user):
 
     #The user must have the correct credentials
     requestedMeasurement = db.get_measurement_with_id(id)
-    if not (current_user['isAdmin'] or (requestedMeasurement['user_id'] == current_user['UserID'])):
-            return jsonify({'message':'Unauthorized access'}),401
-    
+
     if not requestedMeasurement:
         return jsonify({'message':'Measurement not found'}),404    
+
+    if not (current_user['isAdmin'] or (requestedMeasurement['user_id'] == current_user['UserID'])):
+            return jsonify({'message':'Unauthorized access'}),401
     
     #Send the results
     if request.method == 'GET':
@@ -258,6 +298,7 @@ def api_filter(current_user):
 
     if request.method == 'DELETE':
         db.delete_measurement(id)
+        #db.delete_all_measurements_for_user(int(current_user['UserID']))
         return jsonify({'message':"Measurement with id={} deleted".format(id)}), 200
   
 
@@ -339,7 +380,7 @@ def download(current_user):
 
 if __name__== '__main__':
     #app.run(debug=True)
-    app.run(host='192.168.0.108',port=5000,debug=True)
+    app.run(host=app.config['localIP'],port=5000,debug=True)
 
 
 # To do - Inverstigar:
