@@ -1,6 +1,7 @@
 import os
 from os.path import isfile, getsize
 import sqlite3
+import datetime as dt
 
 allowedTimeSlots = ("antes del desayuno","despues del desayuno","antes del almuerzo","despues del almuerzo",
                     "antes de la merienda","despues de la merienda","antes de la cena","despues de la cena")
@@ -8,10 +9,10 @@ allowedTimeSlots = ("antes del desayuno","despues del desayuno","antes del almue
 user_fields = ("UserID","name","hashed_password","public_id","isAdmin")
 
 def dict_factory(cursor, row):
-	    d = {}
-	    for idx, col in enumerate(cursor.description):
-	        d[col[0]] = row[idx]
-	    return d
+		d = {}
+		for idx, col in enumerate(cursor.description):
+			d[col[0]] = row[idx]
+		return d
 
 class GlucoseDB():
 	def __init__(self,filename):
@@ -35,32 +36,22 @@ class GlucoseDB():
 	def getDBConnection(self):
 
 		filename = self.filename
-
 		if not isfile(filename):
 			return self.freshMeasurementsDB()
 		if getsize(filename) >= 100: # SQLite database file header is 100 bytes
 			with open(filename, 'rb') as fd: header = fd.read(100)
 
-	    	if header[:16] == 'SQLite format 3\x00':
-	    		# is a valid db file
-	    		return sqlite3.connect(filename, detect_types=sqlite3.PARSE_DECLTYPES)
+			if header[:16] == b'SQLite format 3\x00':
+				# is a valid db file
+				return sqlite3.connect(filename, detect_types=sqlite3.PARSE_DECLTYPES)
 
-		os.rename(filename,'backup-{}.db'.format(dt.datetime.now()))
+		os.rename(filename,'Backup/backup-{}.db'.format(dt.datetime.now()))
 		return self.freshMeasurementsDB()
 
 #---------- Measurement related queries -------------------------
 
-	def insert_measure(self,user_id,timeSlot,date,value=0,carbs=0,correction_insuline=0,food_insuline=0):
-		new_measure = {
-			'value': value,
-			'timeSlot': timeSlot,
-			'date': date,
-			'user_id': user_id,
-			'carbs': carbs,
-			'correction_insuline': correction_insuline,
-			'food_insuline' : food_insuline
-		}
-
+	def insert_measure(self,user_id,new_measure):
+		new_measure["user_id"] = user_id
 		conn = self.getDBConnection()
 		conn.row_factory = dict_factory
 		cur = conn.cursor()
@@ -69,31 +60,42 @@ class GlucoseDB():
 		conn.commit()
 		conn.close()
 
+	def modify_measure(self,aMeasure):
+		conn = self.getDBConnection()
+		conn.row_factory = dict_factory
+		cur = conn.cursor()
+
+		sql = '''UPDATE measurements 
+					SET value={}, timeSlot="{}", date="{}", carbs={}, correction_insuline={}, food_insuline={}
+					WHERE id={}'''.format(aMeasure["value"],aMeasure["timeSlot"],aMeasure["date"],aMeasure["carbs"],aMeasure["correction_insuline"],aMeasure["food_insuline"],aMeasure["id"])
+
+		cur.execute(sql)
+		conn.commit()
+		conn.close()
 
 	def get_measurements(self,user_id,starting_date,end_date,ordered=False):
-	    query = "SELECT * FROM measurements WHERE user_id = {} AND date BETWEEN".format(user_id)
-	    to_filter = []    
+		query = "SELECT * FROM measurements WHERE user_id = {} AND date BETWEEN".format(user_id)
+		to_filter = []    
 
-	    query += ' ? AND'
-	    to_filter.append(starting_date)
-	    query += ' ?'
-	    to_filter.append(end_date)
-	    if ordered:
-	        query += ' ORDER BY date ASC'
-	    query += ';'
+		query += ' ? AND'
+		to_filter.append(starting_date)
+		query += ' ?'
+		to_filter.append(end_date)
+		if ordered:
+		    query += ' ORDER BY date ASC'
+		query += ';'
 
-	    conn = self.getDBConnection()
-	    conn.row_factory = dict_factory
-	    cur = conn.cursor()
+		conn = self.getDBConnection()
+		conn.row_factory = dict_factory
+		cur = conn.cursor()
 
-	    results = cur.execute(query, to_filter).fetchall()
+		results = cur.execute(query, to_filter).fetchall()
 
-	    conn.close()
+		conn.close()
 
-	    return results
+		return results
 
 	def get_all_measures(self,user_id):
-		#Todo devolver solo los correspondientes al usuario
 		conn = self.getDBConnection()
 		conn.row_factory = dict_factory
 		cur = conn.cursor()
@@ -113,10 +115,13 @@ class GlucoseDB():
 		results = cur.execute(query).fetchall()
 		conn.close()
 
+		if results:
+			return results[0]
+
 		return results
 
 
-	def delete_measure(self,id):
+	def delete_measurement(self,id):
 		query = "DELETE FROM measurements WHERE id={};".format(id)
 
 		conn = self.getDBConnection()
@@ -126,6 +131,15 @@ class GlucoseDB():
 		conn.commit()
 		conn.close()
 
+	def delete_all_measurements_for_user(self,id):
+		query = "DELETE FROM measurements WHERE user_id={};".format(id)
+
+		conn = self.getDBConnection()
+		conn.row_factory = dict_factory
+		cur = conn.cursor()
+		results = cur.execute(query)
+		conn.commit()
+		conn.close()
 
 # ----------- Users table -------------------------------------------------
 
@@ -149,17 +163,26 @@ class GlucoseDB():
 	def get_user_with_name(self,aSearchedUsername):
 		#Check if user exists without passing it to the DB controler (prevent injection)
 		#To do: la bd es chica, investigar como hacerlo para que escale 
-	    users = self.get_all_users()
 
-	    user_info = next( (user for user in users if user['name'] == aSearchedUsername), None)
+		users = self.get_all_users()
 
-	    return user_info
+		user_info = next( (user for user in users if user['name'] == aSearchedUsername), None)
+
+		return user_info
 
 	def get_user_by_public_id(self,aPublicId):
 
 		users = self.get_all_users()
 
 		user_info = next( (user for user in users if user['public_id'] == aPublicId), None)
+
+		return user_info
+
+	def get_user_by_id(self,aId):
+
+		users = self.get_all_users()
+
+		user_info = next( (user for user in users if user['UserID'] == aId), None)
 
 		return user_info
 
@@ -177,7 +200,8 @@ class GlucoseDB():
 
 		for field in update_data:
 			if field in user_fields:
-				if isinstance(update_data[field], basestring):
+				#if isinstance(update_data[field], basestring): #python 2
+				if isinstance(update_data[field], str): #python 3
 					value = update_data[field]
 				else:
 					value = int(update_data[field])
@@ -186,6 +210,7 @@ class GlucoseDB():
 				run_query(self,query)
 
 	def delete_user(self,id):
+		
 		query = "DELETE FROM users WHERE UserID={};".format(id)
 		run_query(self,query)
 		
